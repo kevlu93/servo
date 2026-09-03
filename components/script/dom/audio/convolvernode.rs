@@ -41,6 +41,14 @@ impl ConvolverNodeMethods<crate::DomTypeHolder> for ConvolverNode {
         options: &ConvolverOptions,
     ) -> Fallible<DomRoot<ConvolverNode>> {
         let node_options = options.parent.unwrap_or(2, ChannelCountMode::Clamped_max, ChannelInterpretation::Speakers);
+        /// <https://webaudio.github.io/web-audio-api/#audionode-channelcount-constraints>
+        if node_options.count > 2 {
+            return Err(Error::NotSupported(Some(String::from("Channel count greater than 2 is not supported"))));
+        }
+        /// <https://webaudio.github.io/web-audio-api/#audionode-channelcountmode-constraints>
+        if let ChannelCountMode::Max = node_options.mode {
+            return Err(Error::NotSupported(Some(String::from("Channel count mode Max is not supported"))));
+        }
         let convolver_options = AudioNodeInit::ConvolverNode(options.convert(cx));
         let source_node = AudioNode::new_inherited(cx, convolver_options, context, node_options, 1, 1)?;
         let node = ConvolverNode {
@@ -107,6 +115,10 @@ impl ConvolverNodeMethods<crate::DomTypeHolder> for ConvolverNode {
     /// <https://webaudio.github.io/web-audio-api/#dom-convolvernode-normalize>
     fn SetNormalize(&self, value: bool) {
        self.normalize.set(value);
+        self.source_node
+        .message(AudioNodeMessage::ConvolverNode(
+            ConvolverNodeMessage::SetNormalize(value),
+        ));
     }
 }
 

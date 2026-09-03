@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use fft_convolver::FFTConvolver;
 use log::error;
 use malloc_size_of_derive::MallocSizeOf;
 use num_complex::Complex64;
@@ -26,7 +27,7 @@ pub(crate) struct ConvolverNode {
     buffer: Option<AudioBuffer>,
     normalize: bool,
     normalization_scale: Option<f64>,
-    buffer_ffts: Option<Vec<Vec<Complex64>>>
+    convolvers: Option<Vec<FFTConvolver<f32>>>,
 }
 
 fn calculate_normalization_scale(buffer: &Option<AudioBuffer>, normalize: bool) -> Option<f64> {
@@ -65,51 +66,40 @@ fn calculate_normalization_scale(buffer: &Option<AudioBuffer>, normalize: bool) 
     }
 }
 
-fn calculate_buffer_fft(buffer: &[f32]) -> Vec<Complex64> {
-    let length = (FRAMES_PER_BLOCK_USIZE + (buffer.len() -1) * 2 - 1).div_ceil(FRAMES_PER_BLOCK_USIZE) * FRAMES_PER_BLOCK_USIZE;
-    let mut planner = RealFftPlanner::<f64>::new();
-    // Calculate FFTs for the input and impulse response
-    let fft = planner.plan_fft_forward(length);
-    let mut input = buffer.iter().map(|x| *x as f64).collect::<Vec<_>>();
-    input.resize(length, 0.0);
-    let mut output = fft.make_output_vec();
-    fft.process(&mut input, &mut output).unwrap();
-    output
+fn initialize_convolvers(buffer: Option<&AudioBuffer>) -> Option<Vec<FFTConvolver<f32>>> {
+    let buffer = buffer?;
+    let mut convolvers = buffer.buffers.iter().map(|impulse_response| {
+        let mut convolver = FFTConvolver::<f32>::default();
+        convolver.init(FRAMES_PER_BLOCK_USIZE * 2, impulse_response.as_slice()).inspect_err(|e| error!("Failed to initialize convolver {}", e)).ok()?;
+        Some(convolver)
+    }).collect::<Option<Vec<_>>>();
+    // If we have a mono IR, need to create two convolvers.
+    // This is to ensure we can handle the stereo input chanse, since the FFT Convolver 
+    // assumes inputs are blocks of a long-running sample.
+    if let Some(convolvers) = &mut convolvers {
+        if convolvers.len() == 1 {
+            convolvers.push(convolvers[0].clone());
+        }
+    }
+    convolvers
 }
 
-// Quickly calculate the linear convolution of the input and buffer FFT
-// Based on convolution theorem
-fn linear_convolution(input: &[f32], impulse_response_fft: &[Complex64]) -> Vec<f64> {
-    // We want the next multiple of FRAMES_PER_BLOCK >= N + M - 1
-    // Remember that impulse response fft is size N/2 + 1
-    let length = (impulse_response_fft.len() - 1) * 2;
-    let mut planner = RealFftPlanner::<f64>::new();
-    // Calculate FFTs for the input and impulse response
-    let fft = planner.plan_fft_forward(length);
-    let mut input = input.iter().map(|x| *x as f64).collect::<Vec<_>>();
-    input.resize(length, 0.0);
-    let mut output = fft.make_output_vec();
-    fft.process(&mut input, &mut output).unwrap();
-
-    // Calculate the element wise product
-    let mut product = output.iter().zip(impulse_response_fft.iter()).map(|(f, g)| f * g).collect::<Vec<_>>();
-
-    // Now take the inverse FFT of the product
-    let ifft = planner.plan_fft_inverse(length);
-    let mut convolution_output = ifft.make_output_vec();
-    ifft.process(&mut product, &mut convolution_output).unwrap();
-    convolution_output.iter().map(|x| *x / length as f64).collect::<Vec<_>>()
+fn linear_convolution(input: &[f32], convolver: &mut FFTConvolver<f32>) -> Option<Vec<f32>> {
+    let mut output = vec![0.0; FRAMES_PER_BLOCK_USIZE];
+    convolver.process(input, output.as_mut_slice()).inspect_err(|e| error!("Linear convolution of input with impulse response failed {}", e)).ok()?;
+    Some(output)
 }
 
 impl ConvolverNode {
     pub fn new(options: ConvolverNodeOptions, channel_info: ChannelInfo) -> Self {
         let normalization_scale = calculate_normalization_scale(&options.buffer, options.normalize);
+        let convolvers = initialize_convolvers(options.buffer.as_ref());
         Self {
             channel_info,
             buffer: options.buffer,
             normalize: options.normalize,
             normalization_scale,
-            buffer_ffts: Default::default()
+            convolvers,
         }
     }
 
@@ -119,7 +109,7 @@ impl ConvolverNode {
                 self.buffer = buffer;
                 self.normalization_scale = calculate_normalization_scale(&self.buffer, self.normalize);
                 // Precompute buffer FFTs
-                self.buffer_ffts = self.buffer.as_ref().map(|buffers| buffers.buffers.iter().map(|buffer| calculate_buffer_fft(buffer.as_slice())).collect());
+                self.convolvers = initialize_convolvers(self.buffer.as_ref());
             },
             ConvolverNodeMessage::SetNormalize(normalize) => {
                 self.normalize = normalize;
@@ -140,7 +130,7 @@ impl AudioNodeEngine for ConvolverNode {
             return inputs;
         };
 
-        let Some(buffer_ffts) = self.buffer_ffts.as_ref() else {
+        let Some(convolvers) = &mut self.convolvers else {
             return inputs;
         };
 
@@ -148,12 +138,12 @@ impl AudioNodeEngine for ConvolverNode {
         let mut convolution_output = match (input_block.chan_count(), buffer.chans()) {
             // Mono with Mono
             (1, 1) => {
-                linear_convolution(input_block.data_chan(0), buffer_ffts[0].as_slice()).iter().map(|x| *x as f32).collect::<Vec<_>>()
+                linear_convolution(input_block.data_chan(0), &mut convolvers[0]).unwrap_or_default()
             }
             // Mono with Stereo Response
             (1, 2) => {
-                let output_0 = linear_convolution(input_block.data_chan(0), buffer_ffts[0].as_slice()).iter().map(|x| *x as f32).collect::<Vec<_>>();
-                let output_1 = linear_convolution(input_block.data_chan(0), buffer_ffts[1].as_slice()).iter().map(|x| *x as f32).collect::<Vec<_>>();
+                let output_0 = linear_convolution(input_block.data_chan(0), &mut convolvers[0]).unwrap_or_default();
+                let output_1 = linear_convolution(input_block.data_chan(0), &mut convolvers[1]).unwrap_or_default();
 
                 let mut output = Vec::with_capacity(output_0.len() * 2);
                 output.extend(output_0);
@@ -162,8 +152,8 @@ impl AudioNodeEngine for ConvolverNode {
             }
             // Stereo with Mono Response
             (2, 1) => {
-                let output_0 = linear_convolution(input_block.data_chan(0), buffer_ffts[0].as_slice()).iter().map(|x| *x as f32).collect::<Vec<_>>();
-                let output_1 = linear_convolution(input_block.data_chan(1), buffer_ffts[0].as_slice()).iter().map(|x| *x as f32).collect::<Vec<_>>();
+                let output_0 = linear_convolution(input_block.data_chan(0), &mut convolvers[0]).unwrap_or_default();
+                let output_1 = linear_convolution(input_block.data_chan(1), &mut convolvers[1]).unwrap_or_default();
 
                 let mut output = Vec::with_capacity(output_0.len() * 2);
                 output.extend(output_0);
@@ -172,8 +162,8 @@ impl AudioNodeEngine for ConvolverNode {
             }
             // Stereo with Stereo Response
             (2, 2) => {
-                let output_0 = linear_convolution(input_block.data_chan(0), buffer_ffts[0].as_slice()).iter().map(|x| *x as f32).collect::<Vec<_>>();
-                let output_1 = linear_convolution(input_block.data_chan(1), buffer_ffts[1].as_slice()).iter().map(|x| *x as f32).collect::<Vec<_>>();
+                let output_0 = linear_convolution(input_block.data_chan(0), &mut convolvers[0]).unwrap_or_default();
+                let output_1 = linear_convolution(input_block.data_chan(1), &mut convolvers[1]).unwrap_or_default();
 
                 let mut output = Vec::with_capacity(output_0.len() * 2);
                 output.extend(output_0);
@@ -182,10 +172,10 @@ impl AudioNodeEngine for ConvolverNode {
             }
             // Stereo with "true" Stereo Matrix Response
             (2, 4) => {
-                let output_0 = linear_convolution(input_block.data_chan(0), buffer_ffts[0].as_slice()).iter().map(|x| *x as f32).collect::<Vec<_>>();
-                let output_1 = linear_convolution(input_block.data_chan(0), buffer_ffts[1].as_slice()).iter().map(|x| *x as f32).collect::<Vec<_>>();
-                let output_2 = linear_convolution(input_block.data_chan(1), buffer_ffts[2].as_slice()).iter().map(|x| *x as f32).collect::<Vec<_>>();
-                let output_3 = linear_convolution(input_block.data_chan(1), buffer_ffts[3].as_slice()).iter().map(|x| *x as f32).collect::<Vec<_>>();
+                let output_0 = linear_convolution(input_block.data_chan(0), &mut convolvers[0]).unwrap_or_default();
+                let output_1 = linear_convolution(input_block.data_chan(0), &mut convolvers[1]).unwrap_or_default();
+                let output_2 = linear_convolution(input_block.data_chan(1), &mut convolvers[2]).unwrap_or_default();
+                let output_3 = linear_convolution(input_block.data_chan(1), &mut convolvers[3]).unwrap_or_default();
                 let mut output = Vec::with_capacity(output_0.len() * 4);
                 output.extend(output_0);
                 output.extend(output_1);
@@ -195,10 +185,10 @@ impl AudioNodeEngine for ConvolverNode {
             }
             // Mono with Stereo Matrix Response
             (1, 4) => {
-                let output_0 = linear_convolution(input_block.data_chan(0), buffer_ffts[0].as_slice()).iter().map(|x| *x as f32).collect::<Vec<_>>();
-                let output_1 = linear_convolution(input_block.data_chan(0), buffer_ffts[1].as_slice()).iter().map(|x| *x as f32).collect::<Vec<_>>();
-                let output_2 = linear_convolution(input_block.data_chan(0), buffer_ffts[2].as_slice()).iter().map(|x| *x as f32).collect::<Vec<_>>();
-                let output_3 = linear_convolution(input_block.data_chan(0), buffer_ffts[3].as_slice()).iter().map(|x| *x as f32).collect::<Vec<_>>();
+                let output_0 = linear_convolution(input_block.data_chan(0), &mut convolvers[0]).unwrap_or_default();
+                let output_1 = linear_convolution(input_block.data_chan(0), &mut convolvers[1]).unwrap_or_default();
+                let output_2 = linear_convolution(input_block.data_chan(1), &mut convolvers[2]).unwrap_or_default();
+                let output_3 = linear_convolution(input_block.data_chan(1), &mut convolvers[3]).unwrap_or_default();
                 let mut output = Vec::with_capacity(output_0.len() * 4);
                 output.extend(output_0);
                 output.extend(output_1);

@@ -41,9 +41,6 @@
 
         let convolver = context.createConvolver();
 	let bufferChannels = squarePulse.numberOfChannels;
-	console.log('Created convolver node');
-	console.log(`buffer number of channels ${bufferChannels}`);
-	console.log(`buffer length ${squarePulse.length}`);
         convolver.normalize = false;
         convolver.buffer = squarePulse;
 
