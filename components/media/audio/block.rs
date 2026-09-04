@@ -585,6 +585,22 @@ impl<'a> FrameRef<'a> {
             }
         }
     }
+
+    #[inline]
+    /// Gets the data in the current frame of the block
+    /// Returned slice with one value per channel
+    pub fn get_frame(&self) -> Vec<f32>
+    {
+        if self.block.repeat {
+            vec![self.block.buffer[self.frame.0 as usize]; self.block.channels as usize]
+        } else {
+            let mut frames = Vec::with_capacity(self.block.channels as usize);
+            for channel in 0..self.block.channels {
+                frames.push(self.block.buffer[channel as usize * FRAMES_PER_BLOCK_USIZE + self.frame.0 as usize]);
+            }
+            frames
+        }
+    }
 }
 
 // operator impls
