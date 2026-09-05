@@ -39,7 +39,10 @@ impl DelayNodeMethods<crate::DomTypeHolder> for DelayNode {
         context: &BaseAudioContext,
         options: &DelayOptions,
     ) -> Fallible<DomRoot<DelayNode>> {
-        let node_options = options.parent.unwrap_or(2, ChannelCountMode::Max, ChannelInterpretation::Speakers);
+        let node_options =
+            options
+                .parent
+                .unwrap_or(2, ChannelCountMode::Max, ChannelInterpretation::Speakers);
         let delay_time = *options.delayTime;
         let max_delay_time = *options.maxDelayTime;
         let delay_options = AudioNodeInit::DelayNode(options.convert());
@@ -78,6 +81,9 @@ impl DelayNodeMethods<crate::DomTypeHolder> for DelayNode {
 
 impl Convert<DelayNodeOptions> for DelayOptions {
     fn convert(self) -> DelayNodeOptions {
-        DelayNodeOptions { max_delay_time: *self.maxDelayTime, delay_time: *self.delayTime}
+        DelayNodeOptions {
+            max_delay_time: *self.maxDelayTime,
+            delay_time: *self.delayTime,
+        }
     }
 }

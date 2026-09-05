@@ -368,12 +368,18 @@ impl BaseAudioContextMethods<crate::DomTypeHolder> for BaseAudioContext {
         GainNode::new(cx, self.global().as_window(), self, &GainOptions::empty())
     }
 
-    fn CreateDelay(&self, cx: &mut JSContext, max_delay_time: Finite<f64>) -> Fallible<DomRoot<DelayNode>> {
+    fn CreateDelay(
+        &self,
+        cx: &mut JSContext,
+        max_delay_time: Finite<f64>,
+    ) -> Fallible<DomRoot<DelayNode>> {
         // <https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-createdelay-maxdelaytime-maxdelaytime>
-        // Specifies the maximum delay time in seconds allowed for the delay line. 
+        // Specifies the maximum delay time in seconds allowed for the delay line.
         // If specified, this value MUST be greater than zero and less than three minutes.
         if *max_delay_time <= 0. || *max_delay_time > 180. {
-            return Err(Error::NotSupported(Some(String::from("maxDelayTime is not within 0 - 3 minutes"))));
+            return Err(Error::NotSupported(Some(String::from(
+                "maxDelayTime is not within 0 - 3 minutes",
+            ))));
         }
         let mut options = DelayOptions::empty();
         options.maxDelayTime = max_delay_time;
