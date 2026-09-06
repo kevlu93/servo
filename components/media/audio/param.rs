@@ -33,6 +33,7 @@ pub enum ParamDir {
 /// An AudioParam.
 ///
 /// <https://webaudio.github.io/web-audio-api/#AudioParam>
+#[derive(Clone)]
 pub struct Param {
     val: f32,
     kind: ParamRate,

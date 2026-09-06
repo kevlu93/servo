@@ -44,6 +44,12 @@ impl Default for Chunk {
 }
 
 impl Chunk {
+    pub fn new(block: Block) -> Self {
+        Chunk {
+            blocks: smallvec![block; 1],
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
     }

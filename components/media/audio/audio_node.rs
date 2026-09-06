@@ -64,7 +64,9 @@ pub enum AudioNodeType {
     ChannelSplitterNode,
     ConstantSourceNode,
     ConvolverNode,
-    DelayNode,
+    DelayNode, 
+    DelayReader, // Only constructed internally by the DelayNode
+    DelayWriter, // Only constructed internally by the DelayNode
     DestinationNode,
     DynamicsCompressionNode,
     GainNode,
@@ -108,7 +110,7 @@ impl BlockInfo {
     }
 }
 
-#[derive(MallocSizeOf)]
+#[derive(Clone, Copy, MallocSizeOf)]
 pub struct ChannelInfo {
     pub count: u8,
     pub mode: ChannelCountMode,
