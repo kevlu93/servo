@@ -2,27 +2,30 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::any::Any;
 use std::collections::VecDeque;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use f32;
+use log::error;
 use malloc_size_of_derive::MallocSizeOf;
+use parking_lot::{Mutex, RwLock};
 
 use crate::audio_node::{
-    AudioNodeEngine, AudioNodeMessage, AudioNodeType, BlockInfo, ChannelInfo, ChannelInterpretation
+    AudioNodeEngine, AudioNodeType, BlockInfo, ChannelInfo, ChannelInterpretation,
 };
 use crate::block::{Block, Chunk};
-use crate::param::{Param, ParamRate, ParamType, UserAutomationEvent};
+use crate::param::{Param, ParamType};
 
-mod delay_writer;
 mod delay_reader;
+mod delay_writer;
 pub(crate) use delay_reader::DelayReader;
 pub(crate) use delay_writer::DelayWriter;
 
 // Share with internal nodes. Use Arc because AudioNodeEngine requires Send
 type DelayBuffer = Arc<RwLock<VecDeque<Block>>>;
 type CachedUpmixedBlock = Arc<RwLock<Option<UpmixedBlock>>>;
-type SharedParam = Arc<RwLock<Param>>;
+type AccessLock = Arc<Mutex<bool>>;
 
 #[derive(Copy, Clone, Debug, MallocSizeOf)]
 pub struct DelayNodeOptions {
@@ -42,10 +45,8 @@ impl Default for DelayNodeOptions {
 #[derive(AudioNodeCommon)]
 pub(crate) struct DelayNode {
     channel_info: ChannelInfo,
-    delay_time: Param,
-    shared_delay_time: SharedParam,
-    delay_writer: DelayWriter,
-    delay_reader: DelayReader,
+    delay_writer: Option<Box<DelayWriter>>,
+    delay_reader: Option<Box<DelayReader>>,
 }
 
 #[derive(Debug)]
@@ -83,37 +84,46 @@ impl DelayNode {
     pub fn new(options: DelayNodeOptions, channel_info: ChannelInfo) -> Self {
         let delay_line = Arc::new(RwLock::new(VecDeque::with_capacity(0)));
         let upmixed_block = Arc::new(RwLock::new(None));
-        let delay_time = Param::new(options.delay_time as f32);
-        let shared_delay_time = Arc::new(RwLock::new(delay_time.clone()));
+        let accessed_first = Arc::new(Mutex::new(true));
         DelayNode {
             channel_info: channel_info,
-            delay_time,
-            shared_delay_time: shared_delay_time.clone(),
-            delay_writer: DelayWriter::new(delay_line.clone(), upmixed_block.clone(), channel_info, options.max_delay_time),
-            delay_reader: DelayReader::new(delay_line.clone(), upmixed_block.clone(), shared_delay_time.clone(), channel_info),
+            delay_writer: Some(Box::new(DelayWriter::new(
+                accessed_first.clone(),
+                delay_line.clone(),
+                upmixed_block.clone(),
+                channel_info,
+                options.max_delay_time,
+            ))),
+            delay_reader: Some(Box::new(DelayReader::new(
+                accessed_first.clone(),
+                delay_line,
+                upmixed_block,
+                Param::new(options.delay_time as f32),
+                channel_info,
+            ))),
         }
     }
 
-    fn set_param(&mut self, id: ParamType, event: UserAutomationEvent, sample_rate: f32) {
-        match id {
-            ParamType::DelayTime => {
-                let mut delay_time = self.shared_delay_time.write().unwrap();
-                delay_time.insert_event(event.convert_to_event(sample_rate))
-
-            },
-            _ => panic!("Unknown param {:?} for DelayNode", id),
-        }
+    pub fn take_delay_reader(&mut self) -> Option<Box<DelayReader>> {
+        self.delay_reader.take()
     }
 
-    fn set_param_rate(&mut self, id: ParamType, rate: ParamRate) {
-        match id {
-            ParamType::DelayTime => {
-                let mut delay_time = self.shared_delay_time.write().unwrap();
-                delay_time.set_rate(rate)
+    pub fn take_delay_writer(&mut self) -> Option<Box<DelayWriter>> {
+        self.delay_writer.take()
+    }
 
-            },
-            _ => panic!("Unknown param {:?} for DelayNode", id),
-        }
+    pub fn set_delay_reader(&mut self, reader: Option<Box<DelayReader>>) {
+        self.delay_reader = reader;
+    }
+
+    pub fn set_delay_writer(&mut self, writer: Option<Box<DelayWriter>>) {
+        self.delay_writer = writer;
+    }
+
+    pub fn set_cycle_breaker_status(&mut self, status: bool) {
+        self.delay_reader.as_mut().map(|reader| {
+            reader.set_cycle_breaker_status(status);
+        });
     }
 }
 
@@ -123,34 +133,34 @@ impl AudioNodeEngine for DelayNode {
     }
 
     fn process(&mut self, inputs: Chunk, info: &BlockInfo) -> Chunk {
-        self.delay_writer.process(inputs, info);
+        let Some(delay_writer) = &mut self.delay_writer else {
+            error!("No DelayWriter initialized!");
+            return Chunk::explicit_silence();
+        };
+        delay_writer.process(inputs, info);
 
         // Read from the internal buffer
-        self.delay_reader.process(Chunk::default(), info)
-    }
-
-    fn message(&mut self, msg: AudioNodeMessage, sample_rate: f32) {
-        match msg {
-            AudioNodeMessage::GetParamValue(id, tx) => {
-                let _ = tx.send(self.get_param(id).value());
-            },
-            AudioNodeMessage::SetChannelCount(c) => self.set_channel_count(c),
-            AudioNodeMessage::SetChannelMode(c) => self.set_channel_count_mode(c),
-            AudioNodeMessage::SetChannelInterpretation(c) => self.set_channel_interpretation(c),
-            // SetParam and SetParamRate behave differently because delay time must be shared with DelayReader.
-            // However, DelayReader is internal and the Param can only be set through the DelayNode.
-            AudioNodeMessage::SetParam(id, event) => self.set_param(id, event, sample_rate),
-            AudioNodeMessage::SetParamRate(id, rate) => self.set_param_rate(id, rate),
-            _ => self.message_specific(msg, sample_rate),
-        }
+        let Some(delay_reader) = &mut self.delay_reader else {
+            error!("No DelayReader initialized!");
+            return Chunk::explicit_silence();
+        };
+        let output = delay_reader.process(Chunk::default(), info);
+        output
     }
 
     fn get_param(&mut self, id: ParamType) -> &mut Param {
-        let delay_time = self.shared_delay_time.write().unwrap();
-        self.delay_time = delay_time.clone();
-        match id {
-            ParamType::DelayTime => &mut self.delay_time,
-            _ => panic!("Unknown param {:?} for DelayNode", id),
-        }
+        // DelayReader should not be None when `get_param` is called.
+        // The only time DelayNode gives up ownership of its DelayReader is within a render quantum
+        // processing loop, when it gives ownership to the graph. In this case it has removed itself
+        // from the graph so it will not be processed, and therefore never call `get_param` within the
+        // processing loop.
+        self.delay_reader
+            .as_mut()
+            .expect("Tried to get delay_time Param without an owned DelayReader.")
+            .get_param(id)
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
     }
 }

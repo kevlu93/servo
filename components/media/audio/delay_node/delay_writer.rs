@@ -1,12 +1,16 @@
+use std::any::Any;
+
 use log::error;
 use num_traits::Zero;
 
-use crate::{audio_node::{AudioNodeEngine, AudioNodeType, BlockInfo, ChannelInfo}, block::{Chunk, FRAMES_PER_BLOCK_USIZE}, delay_node::{CachedUpmixedBlock, DelayBuffer}};
-
+use crate::audio_node::{AudioNodeEngine, AudioNodeType, BlockInfo, ChannelInfo};
+use crate::block::{Chunk, FRAMES_PER_BLOCK_USIZE};
+use crate::delay_node::{AccessLock, CachedUpmixedBlock, DelayBuffer};
 
 #[derive(AudioNodeCommon)]
 pub(crate) struct DelayWriter {
     channel_info: ChannelInfo,
+    accessed_first: AccessLock,
     // Ring buffer where we push to the front
     // Easier mental model since entries in the back are the oldest
     delay_line: DelayBuffer,
@@ -17,9 +21,16 @@ pub(crate) struct DelayWriter {
 }
 
 impl DelayWriter {
-    pub(super) fn new(buffer: DelayBuffer, upmixed_block: CachedUpmixedBlock, channel_info: ChannelInfo, max_delay_time: f64) -> Self {
+    pub(super) fn new(
+        accessed_first: AccessLock,
+        buffer: DelayBuffer,
+        upmixed_block: CachedUpmixedBlock,
+        channel_info: ChannelInfo,
+        max_delay_time: f64,
+    ) -> Self {
         Self {
             channel_info,
+            accessed_first,
             delay_line: buffer,
             upmixed_block: upmixed_block,
             max_delay_time,
@@ -28,11 +39,10 @@ impl DelayWriter {
 
     fn update_delay_line_capacity(&self, capacity: usize) {
         // Only update if the capacity is currently 0
-        if let Ok(mut delay_line) = self.delay_line.write() {
-            if delay_line.capacity().is_zero() {
-                delay_line.reserve(capacity);
-            }
-        };
+        let mut delay_line = self.delay_line.write();
+        if delay_line.capacity().is_zero() {
+            delay_line.reserve(capacity);
+        }
     }
 
     /// Writes the input block to the delay line
@@ -45,22 +55,21 @@ impl DelayWriter {
                 );
                 return;
             };
-            let Ok(mut delay_line) = self.delay_line.write() else {
-                error!("Unable to acquire write lock for the delay buffer.");
-                return;
-            };
+            let mut delay_line = self.delay_line.write();
             let last_index = delay_line.capacity() - 1;
             delay_line.truncate(last_index);
             delay_line.push_front(block);
         }
-        // Shift the index of the existing upmixed block
-        let Ok(mut upmixed_block) = self.upmixed_block.write() else {
-                error!("Unable to acquire write lock for the upmixed block.");
-                return;
-            };
-        if let Some(upmixed_block) = &mut *upmixed_block {
-            upmixed_block.increment_index();
+        // If the writer acquired the access lock first, it shifts the index of the existing upmixed block
+        let mut access_lock = self.accessed_first.lock();
+        if *access_lock {
+            if let Some(upmixed_block) = self.upmixed_block.write().as_mut() {
+                upmixed_block.increment_index();
+            }
         }
+
+        // Negate the access lock boolean
+        *access_lock = !(*access_lock);
     }
 }
 
@@ -81,5 +90,13 @@ impl AudioNodeEngine for DelayWriter {
         // Read from the internal buffer
         self.write(inputs);
         Chunk::default()
+    }
+
+    fn output_count(&self) -> u32 {
+        0
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
     }
 }
