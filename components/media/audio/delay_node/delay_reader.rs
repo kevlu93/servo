@@ -100,8 +100,21 @@ impl DelayReader {
                 (frames.0.min(*delay_frame), frames.1.max(*delay_frame))
             });
         // With the range of delay frames we can check which blocks we will be reading from.
-        let earlier_block = find_block_with_index(max_delay_frame.ceil() as usize);
-        let later_block = find_block_with_index(min_delay_frame.floor() as usize);
+        //
+        // Account for potential offset due to reader processing before the writer.
+        // This can only occur if the delay node is a cycle breaker.
+        // In such a case, subtract FRAMES_PER_BLOCK_USIZE
+        // This is because delay_frames is the frame written time t ago.
+        // delay_frames < FRAMES_PER_BLOCK_USIZE can only work if we assume that the
+        // DelayWriter writes to the inner buffer prior to the DelayReader reading.
+        // This is safe because delay frames is at least FRAMES_PER_BLOCK_USIZE when the delay node
+        // is a cycle breaker.
+        let mut offset = 0;
+        if *self.accessed_first.lock() {
+            offset = FRAMES_PER_BLOCK_USIZE;
+        }
+        let earlier_block = find_block_with_index(max_delay_frame.ceil() as usize - offset);
+        let later_block = find_block_with_index(min_delay_frame.floor() as usize - offset);
         // Now search through the potential blocks for their channel counts
         // By construction earlier blocks are in higher indices of the delay line
         let mut channel_count = 0;
@@ -150,9 +163,8 @@ impl DelayReader {
     /// delay line before the DelayReader begins reading.
     /// However, the DelayReader should behave as if DelayWriter has done so. We can make this
     /// assumption because in a cycle, the minimum delay time is one render quantum.
-    /// We don't have to worry about adjusting for the new blocks written to the delay line.
     /// Therefore, if read occurs before a write, we are looking for:
-    /// delay(t) - FRAMES_PER_BLOCK
+    /// delay(t) - FRAMES_PER_BLOCK + (FRAMES_PER_BLOCK - 1 - t) = delay(t) - 1 - t
     pub(crate) fn read(&mut self) -> Chunk {
         let channel_count = self.calc_output_channel_count();
         // If channel count is 0, then no data is outputted.
@@ -168,17 +180,15 @@ impl DelayReader {
         let delay_line = self.delay_line.read();
         for (tick, delay_frame) in self.delay_frames.into_iter().enumerate() {
             let delay_offset = if *self.accessed_first.lock() {
-                -1 * FRAMES_PER_BLOCK_USIZE as i32
+                -1 - tick as i32
             } else {
                 (FRAMES_PER_BLOCK_USIZE - 1 - tick) as i32
             };
             let delay_frame = delay_frame + delay_offset as f32;
-            //println!("delay_frame after adjusting: {:?}, tick: {:?}", delay_frame, frame.tick().0);
             let lower_frame_index = delay_frame.floor() as usize;
             let higher_frame_index = delay_frame.ceil() as usize;
             let lower_block_index = find_block_with_index(lower_frame_index);
             let higher_block_index = find_block_with_index(higher_frame_index);
-            //println!("searching for blocks: {} {}", lower_block_index, higher_block_index);
             let mut linear_interpolation_factor = delay_frame.fract();
             for (frame_index, block_index) in [
                 (lower_frame_index, lower_block_index),
@@ -205,7 +215,6 @@ impl DelayReader {
                     //TODO: clean this up!!
                     for channel in 0..channel_count as usize {
                         let position_for_block = frame_index % FRAMES_PER_BLOCK_USIZE;
-                        //println!("position_for_block: {:?}", position_for_block);
                         // Remember that block buffer data goes from oldest to newest
                         let upmixed_value = self
                             .upmixed_block
