@@ -49,8 +49,10 @@ pub(crate) struct DelayNode {
     delay_reader: Option<Box<DelayReader>>,
 }
 
+/// UpmixedBlock is a Block that has been upmixed to the output channel count of the DelayReader
 #[derive(Debug)]
 struct UpmixedBlock {
+    // The index of the upmixed block in the delay line
     index: usize,
     block: Block,
 }
@@ -84,9 +86,9 @@ impl DelayNode {
     pub fn new(options: DelayNodeOptions, channel_info: ChannelInfo) -> Self {
         let delay_line = Arc::new(RwLock::new(VecDeque::with_capacity(0)));
         let upmixed_block = Arc::new(RwLock::new(None));
-        let accessed_first = Arc::new(Mutex::new(true));
+        let accessed_first = Arc::new(Mutex::new(false));
         DelayNode {
-            channel_info: channel_info,
+            channel_info,
             delay_writer: Some(Box::new(DelayWriter::new(
                 accessed_first.clone(),
                 delay_line.clone(),
@@ -95,7 +97,7 @@ impl DelayNode {
                 options.max_delay_time,
             ))),
             delay_reader: Some(Box::new(DelayReader::new(
-                accessed_first.clone(),
+                accessed_first,
                 delay_line,
                 upmixed_block,
                 Param::new(options.delay_time as f32),
@@ -121,9 +123,9 @@ impl DelayNode {
     }
 
     pub fn set_cycle_breaker_status(&mut self, status: bool) {
-        self.delay_reader.as_mut().map(|reader| {
+        if let Some(reader) = self.delay_reader.as_mut() {
             reader.set_cycle_breaker_status(status);
-        });
+        }
     }
 }
 
@@ -144,8 +146,7 @@ impl AudioNodeEngine for DelayNode {
             error!("No DelayReader initialized!");
             return Chunk::explicit_silence();
         };
-        let output = delay_reader.process(Chunk::default(), info);
-        output
+        delay_reader.process(Chunk::default(), info)
     }
 
     fn get_param(&mut self, id: ParamType) -> &mut Param {

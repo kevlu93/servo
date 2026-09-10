@@ -1,3 +1,7 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
 use std::any::Any;
 
 use num_traits::Zero;
@@ -7,21 +11,25 @@ use crate::block::{Block, Chunk, FRAMES_PER_BLOCK_USIZE, Tick};
 use crate::delay_node::{AccessLock, CachedUpmixedBlock, DelayBuffer, UpmixedBlock};
 use crate::param::{Param, ParamType};
 
+/// <https://webaudio.github.io/web-audio-api/#delayreader>
+/// > ...an object that has the same interface as an AudioNode,
+/// > and that can read the audio data from the internal buffer of the DelayNode.
+/// > It is connected to the same AudioNodes as the DelayNode it was created from.
 #[derive(AudioNodeCommon)]
 pub(crate) struct DelayReader {
     channel_info: ChannelInfo,
-    // Tracks the delay time in terms of number of frames for each frame in the input block
+    // Tracks the delay time in terms of number of frames, relative to each frame in the input block.
     // When reading from the buffer, we look for the stored block with the relevant frames
     delay_frames: [f32; FRAMES_PER_BLOCK_USIZE],
     // Shared lock that determines whether the DelayReader or the DelayWriter is acting first during
-    // a render quantum
+    // a render quantum.
     accessed_first: AccessLock,
-    // Ring buffer where we push to the front
-    // Easier mental model since entries in the back are the oldest
+    // Ring buffer where we push to the front.
+    // Easier mental model since entries in the back are the oldest.
     delay_line: DelayBuffer,
-    // Block that has been upmixed based on the channel count of the output
+    // Block that has been upmixed based on the channel count of the output.
     upmixed_block: CachedUpmixedBlock,
-    // delay_time param from the delay node
+    // delay_time param passed on from the delay node. Delay time in seconds.
     delay_time: Param,
     // Is the DelayReader part of a cycle breaker?
     is_cycle_breaker: bool,
@@ -44,7 +52,7 @@ impl DelayReader {
             delay_frames: [0.; FRAMES_PER_BLOCK_USIZE],
             accessed_first,
             delay_line: buffer,
-            upmixed_block: upmixed_block,
+            upmixed_block,
             delay_time,
             is_cycle_breaker: false,
         }
@@ -68,8 +76,38 @@ impl DelayReader {
         updated
     }
 
+    /// 1.18.4
+    /// > When producing an output buffer, a DelayReader MUST yield exactly the audio that was written to the
+    /// > corresponding DelayWriter delayTime seconds ago.
+    ///
+    /// We are processing tick t, where t ranges from 0 to (FRAMES_PER_BLOCK - 1).
+    /// The DelayWriter is writing a frame into the delay line every tick.
+    /// Let delay_frame = delay_time * sample_rate, at tick t.
+    /// Now let's process tick t + 1. delay_frame must increase by 1 to account for the new tick.
+    /// There are FRAMES_PER_BLOCK - 1 - t ticks to process after tick t.
+    /// So after processing all ticks (FRAMES_PER_BLOCK - 1),
+    /// delay_frames[t] = delay_time * sample_rate + FRAMES_PER_BLOCK - 1 - t
+    ///
+    /// If a delay node is a cycle breaker, then DelayReader and DelayWriter behave as separate nodes.
+    /// In this case, when processing the graph, it is not guaranteed that the DelayWriter writes to
+    /// delay line before the DelayReader begins reading.
+    /// Suppose the DelayReader begins reading before the corresponding DelayWriter has written to
+    /// the delay line.
+    /// We know delay_frames[t] at the end of a render quantum if the DelayWriter
+    /// is writing a frame every tick.
+    /// However, the write hasn't actually occurred yet. So delay_line is missing 128 frames.
+    /// Therefore, if read occurs before a write, we are looking for:
+    /// delay_frames[t] = delay_time * sample_rate - FRAMES_PER_BLOCK + (FRAMES_PER_BLOCK - 1 - t)
+    /// = delay_time * sample_rate - 1 - t
+    /// This is safe to subtract because in a cycle breaker the minimum delay time is one render quantum.
     fn update_delay_frames(&mut self, tick: usize, value: f32) {
-        self.delay_frames[tick] = value;
+        let t = tick as f32;
+        let offset = if *self.accessed_first.lock() {
+            -1. - t
+        } else {
+            FRAMES_PER_BLOCK_USIZE as f32 - 1. - t
+        };
+        self.delay_frames[tick] = value + offset;
     }
 
     /// Calculates the output channel count
@@ -86,6 +124,7 @@ impl DelayReader {
     /// > When there is an increase in input channel count, the behavior depends on the AudioNode type:
     /// > * For a DelayNode or a DynamicsCompressorNode, the number of output channels MUST increase
     /// >   when the input that was received with greater channel count begins to affect the output.
+    ///
     /// Therefore, we know that output channel count will be the highest channel count of the
     /// blocks read.
     fn calc_output_channel_count(&self) -> u8 {
@@ -100,21 +139,8 @@ impl DelayReader {
                 (frames.0.min(*delay_frame), frames.1.max(*delay_frame))
             });
         // With the range of delay frames we can check which blocks we will be reading from.
-        //
-        // Account for potential offset due to reader processing before the writer.
-        // This can only occur if the delay node is a cycle breaker.
-        // In such a case, subtract FRAMES_PER_BLOCK_USIZE
-        // This is because delay_frames is the frame written time t ago.
-        // delay_frames < FRAMES_PER_BLOCK_USIZE can only work if we assume that the
-        // DelayWriter writes to the inner buffer prior to the DelayReader reading.
-        // This is safe because delay frames is at least FRAMES_PER_BLOCK_USIZE when the delay node
-        // is a cycle breaker.
-        let mut offset = 0;
-        if *self.accessed_first.lock() {
-            offset = FRAMES_PER_BLOCK_USIZE;
-        }
-        let earlier_block = find_block_with_index(max_delay_frame.ceil() as usize - offset);
-        let later_block = find_block_with_index(min_delay_frame.floor() as usize - offset);
+        let earlier_block = find_block_with_index(max_delay_frame.ceil() as usize);
+        let later_block = find_block_with_index(min_delay_frame.floor() as usize);
         // Now search through the potential blocks for their channel counts
         // By construction earlier blocks are in higher indices of the delay line
         let mut channel_count = 0;
@@ -146,100 +172,83 @@ impl DelayReader {
         )
     }
 
+    fn update_accessed_first(&mut self) {
+        let mut accessed_first = self.accessed_first.lock();
+        *accessed_first = !(*accessed_first);
+    }
+
     pub(crate) fn set_cycle_breaker_status(&mut self, status: bool) {
         self.is_cycle_breaker = status;
     }
 
     /// Read frames from the delay line at the values indexed around the specified delays.
-    /// During a render quantum, the standard case (no cycle), write to the delay line occurs first.
-    /// If delay_frame = 0 is the latest frame written in,
-    /// then input block t would be at delay frame (127 - t).
-    /// When calculated, each delay(t) was calculated relative to t.
-    /// Therefore when reading from the delay line,
-    /// we are looking for delay(t) + FRAMES_PER_BLOCK - 1 - t
-    ///
-    /// If a delay node is a cycle breaker, then DelayReader and DelayWriter behave as separate nodes.
-    /// In this case, when processing the graph, it is not guaranteed that the DelayWriter writes to
-    /// delay line before the DelayReader begins reading.
-    /// However, the DelayReader should behave as if DelayWriter has done so. We can make this
-    /// assumption because in a cycle, the minimum delay time is one render quantum.
-    /// Therefore, if read occurs before a write, we are looking for:
-    /// delay(t) - FRAMES_PER_BLOCK + (FRAMES_PER_BLOCK - 1 - t) = delay(t) - 1 - t
-    pub(crate) fn read(&mut self) -> Chunk {
+    pub(super) fn read(&mut self) -> Chunk {
         let channel_count = self.calc_output_channel_count();
         // If channel count is 0, then no data is outputted.
         // In this case we just return an output block with a single channel of 0s.
         if channel_count.is_zero() {
-            let mut semaphore = self.accessed_first.lock();
-            *semaphore = !(*semaphore);
             return Chunk::explicit_silence();
         }
         let mut has_active_value = false;
         // Initialize the output block
         let mut output_block = Block::for_channels_explicit(channel_count);
-        let delay_line = self.delay_line.read();
-        for (tick, delay_frame) in self.delay_frames.into_iter().enumerate() {
-            let delay_offset = if *self.accessed_first.lock() {
-                -1 - tick as i32
-            } else {
-                (FRAMES_PER_BLOCK_USIZE - 1 - tick) as i32
-            };
-            let delay_frame = delay_frame + delay_offset as f32;
-            let lower_frame_index = delay_frame.floor() as usize;
-            let higher_frame_index = delay_frame.ceil() as usize;
-            let lower_block_index = find_block_with_index(lower_frame_index);
-            let higher_block_index = find_block_with_index(higher_frame_index);
-            let mut linear_interpolation_factor = delay_frame.fract();
-            for (frame_index, block_index) in [
-                (lower_frame_index, lower_block_index),
-                (higher_frame_index, higher_block_index),
-            ]
-            .into_iter()
-            {
-                if !linear_interpolation_factor.is_zero() {
-                    let Some(block) = delay_line.get(block_index) else {
-                        continue;
-                    };
-                    {
-                        let mut maybe_upmixed_block = self.upmixed_block.write();
-                        if let Some(upmixed_block) = maybe_upmixed_block.as_ref() {
-                            if upmixed_block.get_index() != block_index {
+        {
+            let delay_line = self.delay_line.read();
+            for (tick, delay_frame) in self.delay_frames.into_iter().enumerate() {
+                let lower_frame_index = delay_frame.floor() as usize;
+                let higher_frame_index = delay_frame.ceil() as usize;
+                let lower_block_index = find_block_with_index(lower_frame_index);
+                let higher_block_index = find_block_with_index(higher_frame_index);
+                let mut linear_interpolation_factor = delay_frame.fract();
+                for (frame_index, block_index) in [
+                    (lower_frame_index, lower_block_index),
+                    (higher_frame_index, higher_block_index),
+                ]
+                .into_iter()
+                {
+                    if !linear_interpolation_factor.is_zero() {
+                        let Some(block) = delay_line.get(block_index) else {
+                            continue;
+                        };
+                        // Update the upmixed block if necessary.
+                        {
+                            let mut maybe_upmixed_block = self.upmixed_block.write();
+                            if let Some(upmixed_block) = maybe_upmixed_block.as_ref() {
+                                if upmixed_block.get_index() != block_index {
+                                    *maybe_upmixed_block =
+                                        Some(self.upmix_block(block_index, channel_count, block));
+                                }
+                            } else {
                                 *maybe_upmixed_block =
                                     Some(self.upmix_block(block_index, channel_count, block));
                             }
-                        } else {
-                            *maybe_upmixed_block =
-                                Some(self.upmix_block(block_index, channel_count, &block));
+                        }
+                        for channel in 0..channel_count as usize {
+                            // Get the position of the target frame within the block
+                            let position_for_block = frame_index % FRAMES_PER_BLOCK_USIZE;
+                            // Remember that block buffer data goes from oldest to newest
+                            let upmixed_value = self
+                                .upmixed_block
+                                .read()
+                                .as_ref()
+                                .map(|upmixed_block| {
+                                    upmixed_block
+                                        .get_block()
+                                        .data_chan_frame(127 - position_for_block, channel as u8)
+                                })
+                                .unwrap_or_default();
+                            // Flag if we are actively processing
+                            if upmixed_value.abs() >= f32::MIN && !has_active_value {
+                                has_active_value = true;
+                            }
+                            let output_channel = output_block.data_chan_mut(channel as u8);
+                            output_channel[tick] += linear_interpolation_factor * upmixed_value;
                         }
                     }
-                    //TODO: clean this up!!
-                    for channel in 0..channel_count as usize {
-                        let position_for_block = frame_index % FRAMES_PER_BLOCK_USIZE;
-                        // Remember that block buffer data goes from oldest to newest
-                        let upmixed_value = self
-                            .upmixed_block
-                            .read()
-                            .as_ref()
-                            .map(|upmixed_block| {
-                                upmixed_block
-                                    .get_block()
-                                    .data_chan_frame(127 - position_for_block, channel as u8)
-                            })
-                            .unwrap_or_default();
-                        if upmixed_value.abs() >= f32::MIN && !has_active_value {
-                            has_active_value = true;
-                        }
-                        let output_channel = output_block.data_chan_mut(channel as u8);
-                        output_channel[tick] += linear_interpolation_factor * upmixed_value;
-                    }
+                    linear_interpolation_factor = 1. - linear_interpolation_factor;
                 }
-                linear_interpolation_factor = 1. - linear_interpolation_factor;
             }
         }
-        // Update the access semaphore
-        let mut semaphore = self.accessed_first.lock();
-        *semaphore = !(*semaphore);
-
         // 1.5.3
         // > A DelayNode in a cycle is actively processing only when
         // the absolute value of any output sample for the current render quantum
@@ -260,9 +269,12 @@ impl AudioNodeEngine for DelayReader {
     }
 
     fn process(&mut self, _inputs: Chunk, info: &BlockInfo) -> Chunk {
+        // Update the accessed_first lock
+        self.update_accessed_first();
         // Reset the delay frames array
         self.delay_frames = [0.; FRAMES_PER_BLOCK_USIZE];
 
+        // Update delay_frames
         for i in 0..FRAMES_PER_BLOCK_USIZE {
             self.update_parameters(info, Tick(i as u64));
         }
