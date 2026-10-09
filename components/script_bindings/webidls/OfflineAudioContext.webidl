@@ -20,5 +20,5 @@ interface OfflineAudioContext : BaseAudioContext {
   attribute EventHandler oncomplete;
 
   Promise<AudioBuffer> startRendering();
-//  Promise<void> suspend(double suspendTime);
+  Promise<undefined> suspend(double suspendTime);
 };

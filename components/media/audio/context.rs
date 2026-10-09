@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::Builder;
 
@@ -12,6 +12,7 @@ use servo_media_traits::{BackendMsg, ClientContextId, MediaInstance, MediaInstan
 
 use crate::AudioBackend;
 use crate::audio_node::{AudioNodeInit, AudioNodeMessage, ChannelInfo};
+use crate::block::Tick;
 use crate::decoder::{AudioDecoder, AudioDecoderCallbacks, AudioDecoderOptions};
 use crate::graph::{AudioGraph, InputPort, NodeId, OutputPort, PortId};
 use crate::render_thread::{AudioRenderThread, AudioRenderThreadMsg, SinkEosCallback};
@@ -230,6 +231,22 @@ impl AudioContext {
 
     // Stop audio processing and close render thread.
     make_state_change!(close, Closed, Close);
+
+    pub fn initialize_suspend_notifier(&self, sender: Sender<u64>) {
+        let _ = self
+            .sender
+            .send(AudioRenderThreadMsg::InitializeSuspendNotifier(sender));
+    }
+
+    pub fn close_suspend_notifier(&self) {
+        let _ = self.sender.send(AudioRenderThreadMsg::CloseSuspendNotifier);
+    }
+
+    pub fn suspend_at_frame(&self, suspend_frame: u64) {
+        let _ = self
+            .sender
+            .send(AudioRenderThreadMsg::SuspendAtFrame(suspend_frame));
+    }
 
     pub fn message_node(&self, id: NodeId, msg: AudioNodeMessage) {
         let _ = self.sender.send(AudioRenderThreadMsg::MessageNode(id, msg));

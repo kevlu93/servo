@@ -2,8 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, Sender};
 
+use log::warn;
 use malloc_size_of_derive::MallocSizeOf;
 use servo_media_streams::{MediaSocket, MediaStreamId};
 
@@ -42,6 +44,10 @@ pub enum AudioRenderThreadMsg {
     Close(Sender<StateChangeResult>),
     SinkNeedData,
     GetCurrentTime(Sender<f64>),
+
+    InitializeSuspendNotifier(Sender<u64>),
+    CloseSuspendNotifier,
+    SuspendAtFrame(u64),
 
     DisconnectAllFrom(NodeId),
     DisconnectOutput(PortId<OutputPort>),
@@ -140,6 +146,8 @@ pub struct AudioRenderThread {
     pub current_time: f64,
     pub current_frame: Tick,
     pub muted: bool,
+    suspend_frames: HashSet<u64>,
+    suspend_notifier: Option<Sender<u64>>,
 }
 
 impl AudioRenderThread {
@@ -173,6 +181,8 @@ impl AudioRenderThread {
             current_time: 0.,
             current_frame: Tick(0),
             muted: false,
+            suspend_frames: Default::default(),
+            suspend_notifier: None,
         })
     }
 
@@ -336,6 +346,15 @@ impl AudioRenderThread {
                 AudioRenderThreadMsg::SetMute(val) => {
                     context.set_mute(val);
                 },
+                AudioRenderThreadMsg::InitializeSuspendNotifier(sender) => {
+                    context.suspend_notifier = Some(sender);
+                },
+                AudioRenderThreadMsg::CloseSuspendNotifier => {
+                    context.suspend_notifier = None;
+                },
+                AudioRenderThreadMsg::SuspendAtFrame(suspend_frame) => {
+                    context.suspend_frames.insert(suspend_frame);
+                },
             };
 
             break_loop
@@ -363,6 +382,22 @@ impl AudioRenderThread {
 
                 if self.state == ProcessingState::Suspended {
                     // Bail out if we just suspended processing.
+                    continue;
+                }
+
+                // If the current frame is equal to a suspend frame,
+                // notify the audio context
+                if self.suspend_frames.remove(&self.current_frame.0) {
+                    if let Some(sender) = &self.suspend_notifier {
+                        let _ = sender.send(self.current_frame.0);
+                        // Set state to suspend so that we don't process any data while the audio
+                        // context completes the suspend ceremony.
+                        self.suspend();
+                    } else {
+                        warn!(
+                            "Suspend frames set without a suspend notifier! Can't suspend context."
+                        );
+                    };
                     continue;
                 }
 

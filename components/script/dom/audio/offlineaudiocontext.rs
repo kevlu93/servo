@@ -3,6 +3,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
+use std::sync::mpsc::Sender;
 use std::sync::{Mutex, mpsc};
 use std::thread::Builder;
 
@@ -13,6 +15,7 @@ use js::rust::HandleObject;
 use script_bindings::cell::DomRefCell;
 use script_bindings::reflector::reflect_dom_object_with_proto;
 use servo_base::id::PipelineId;
+use servo_media::audio::block::{FRAMES_PER_BLOCK, FRAMES_PER_BLOCK_USIZE};
 use servo_media::audio::context::OfflineAudioContextOptions as ServoMediaOfflineAudioContextOptions;
 
 use crate::dom::audio::audiobuffer::{AudioBuffer, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE};
@@ -40,6 +43,7 @@ pub(crate) struct OfflineAudioContext {
     length: u32,
     rendering_started: Cell<bool>,
     pending_rendering_promise: DomRefCell<Option<TracedPromise>>,
+    pending_suspend_promises: DomRefCell<BTreeMap<u64, TracedPromise>>,
 }
 
 impl OfflineAudioContext {
@@ -65,6 +69,7 @@ impl OfflineAudioContext {
             length,
             rendering_started: Cell::new(false),
             pending_rendering_promise: Default::default(),
+            pending_suspend_promises: Default::default(),
         })
     }
 
@@ -222,6 +227,88 @@ impl OfflineAudioContextMethods<crate::DomTypeHolder> for OfflineAudioContext {
             );
         }
 
+        promise
+    }
+
+    /// <https://webaudio.github.io/web-audio-api/#dom-offlineaudiocontext-suspend>
+    fn Suspend(&self, cx: &mut CurrentRealm, suspend_time: Finite<f64>) -> RootedPromise {
+        let promise = Promise::new_in_realm(cx);
+        // > [T]he specified time, which is quantized and rounded up to the render quantum size.
+        // > If the quantized frame number
+        // > 1. is negative or
+        // > 2. is less than or equal to the current time or
+        // > 3. is greater than or equal to the total render duration or
+        // > 4.is scheduled by another suspend for the same time,
+        // > then the promise is rejected with InvalidStateError
+        if *suspend_time < 0. {
+            promise.reject_error(
+                cx,
+                Error::InvalidState(Some(String::from("Negative suspend time invalid."))),
+            );
+            return promise;
+        }
+        let frames = (*suspend_time * *self.context.SampleRate() as f64) as u64;
+        let suspend_frame = frames.div_ceil(FRAMES_PER_BLOCK.0) * FRAMES_PER_BLOCK.0;
+        if suspend_frame as f64 / *self.context.SampleRate() as f64 <= *self.context.CurrentTime() ||
+            suspend_frame >= self.length as u64 ||
+            self.pending_suspend_promises
+                .borrow()
+                .contains_key(&suspend_frame)
+        {
+            promise.reject_error(
+                cx,
+                Error::InvalidState(Some(String::from("Invalid suspend time."))),
+            );
+            return promise;
+        }
+        // If there are no pending suspend promises, spin up a background thread to wait on suspend
+        // notifications from the rendering thread.
+        if self.pending_suspend_promises.borrow().is_empty() {
+            self.pending_suspend_promises
+                .safe_borrow_mut(cx.no_gc())
+                .insert(suspend_frame, promise.to_traced());
+            let (sender, receiver) = mpsc::channel();
+            self.context
+                .audio_context_impl()
+                .lock()
+                .unwrap()
+                .initialize_suspend_notifier(sender);
+            let this = Trusted::new(self);
+            let task_source = self
+                .global()
+                .task_manager()
+                .dom_manipulation_task_source()
+                .to_sendable();
+            Builder::new()
+            .name("OfflineACSuspendListener".to_owned())
+            .spawn(move || {
+                while let Ok(suspend_frame) = receiver.recv() {
+                    let this = this.clone();
+                    task_source.queue(task!(resolve: move |cx| {
+                        let this = this.root();
+                        let promise = this
+                            .pending_suspend_promises
+                            .safe_borrow_mut(cx.no_gc())
+                            .remove(&suspend_frame)
+                            .expect("Should not receive suspend frame with no associated promise").root(cx);
+                        this.context.suspend(&promise);
+                        // Since suspensions should be scheduled when the context is not running,
+                        // if there are no more promises we can close the suspend notifier and thereby
+                        // close this background thread.
+                        if this.pending_suspend_promises.borrow().is_empty() {
+                            this.context.audio_context_impl().lock().unwrap().close_suspend_notifier();
+                        }
+                    }));
+                }
+            })
+            .unwrap();
+        }
+        // Send the suspend frame to the rendering thread
+        self.context
+            .audio_context_impl()
+            .lock()
+            .unwrap()
+            .suspend_at_frame(suspend_frame);
         promise
     }
 }
