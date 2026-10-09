@@ -81,7 +81,7 @@ use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::num::Finite;
-use crate::dom::bindings::refcounted::Trusted;
+use crate::dom::bindings::refcounted::{Trusted, TrustedPromise};
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::domexception::{DOMErrorName, DOMException};
@@ -284,6 +284,41 @@ impl BaseAudioContext {
                     }));
             },
         }
+    }
+
+    pub(crate) fn suspend(&self, promise: &RootedPromise) {
+        let trusted_promise = TrustedPromise::from(promise);
+        match self.audio_context_impl().lock().unwrap().suspend() {
+            Some(_) => {
+                println!("Successfully suspended the audio context");
+                let context = Trusted::new(self);
+                self.global().task_manager().dom_manipulation_task_source().queue(
+                    task!(suspend_ok: move |cx| {
+                        let context = context.root();
+                        let promise = trusted_promise.root(cx);
+                        promise.resolve_native(cx, &());
+                        if context.State() != AudioContextState::Suspended {
+                            context.set_state_attribute(AudioContextState::Suspended);
+                            context.global().task_manager().dom_manipulation_task_source().queue_simple_event(
+                                context.upcast(),
+                                atom!("statechange"),
+                            );
+                        }
+                    })
+                );
+            },
+            None => {
+                // The spec does not define the error case and `suspend` should
+                // never fail, but we handle the case here for completion.
+                self.global()
+                    .task_manager()
+                    .dom_manipulation_task_source()
+                    .queue(task!(suspend_error: move |cx| {
+                        let promise = trusted_promise.root(cx);
+                        promise.reject_error(cx, Error::Type(c"Something went wrong".to_owned()));
+                    }));
+            },
+        };
     }
 
     pub(crate) fn channel_count(&self) -> u32 {
