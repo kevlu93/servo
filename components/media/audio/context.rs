@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::Builder;
 
@@ -12,7 +12,6 @@ use servo_media_traits::{BackendMsg, ClientContextId, MediaInstance, MediaInstan
 
 use crate::AudioBackend;
 use crate::audio_node::{AudioNodeInit, AudioNodeMessage, ChannelInfo};
-use crate::block::Tick;
 use crate::decoder::{AudioDecoder, AudioDecoderCallbacks, AudioDecoderOptions};
 use crate::graph::{AudioGraph, InputPort, NodeId, OutputPort, PortId};
 use crate::render_thread::{AudioRenderThread, AudioRenderThreadMsg, SinkEosCallback};
