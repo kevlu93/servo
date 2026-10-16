@@ -4,7 +4,6 @@
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::sync::mpsc::Sender;
 use std::sync::{Mutex, mpsc};
 use std::thread::Builder;
 
@@ -15,7 +14,7 @@ use js::rust::HandleObject;
 use script_bindings::cell::DomRefCell;
 use script_bindings::reflector::reflect_dom_object_with_proto;
 use servo_base::id::PipelineId;
-use servo_media::audio::block::{FRAMES_PER_BLOCK, FRAMES_PER_BLOCK_USIZE};
+use servo_media::audio::block::FRAMES_PER_BLOCK;
 use servo_media::audio::context::OfflineAudioContextOptions as ServoMediaOfflineAudioContextOptions;
 
 use crate::dom::audio::audiobuffer::{AudioBuffer, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE};
