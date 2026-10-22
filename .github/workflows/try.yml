@@ -7,7 +7,7 @@ on:
     inputs:
       profile:
         required: false
-        default: "debug"
+        default: "checked-release"
         type: choice
         options: ["checked-release", "release", "debug", "production"]
       build-args:
