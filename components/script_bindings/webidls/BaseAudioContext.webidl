@@ -22,7 +22,6 @@ interface BaseAudioContext : EventTarget {
   readonly attribute double currentTime;
   readonly attribute AudioListener listener;
   readonly attribute AudioContextState  state;
-  Promise<undefined> resume();
   attribute EventHandler onstatechange;
   [Throws] AudioBuffer createBuffer(unsigned long numberOfChannels,
                                     unsigned long length,

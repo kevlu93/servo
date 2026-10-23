@@ -30,6 +30,7 @@ interface AudioContext : BaseAudioContext {
 
   AudioTimestamp getOutputTimestamp();
 
+  Promise<undefined> resume();
   Promise<undefined> suspend();
   Promise<undefined> close();
 

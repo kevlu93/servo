@@ -184,7 +184,9 @@ impl BaseAudioContext {
         self.state.get() == AudioContextState::Suspended
     }
 
-    fn push_pending_resume_promise(&self, promise: &RootedPromise) {
+    // TODO: Temporarily pub(crate) scope but will become private
+    // when we move this to AudioContext
+    pub(crate) fn push_pending_resume_promise(&self, promise: &RootedPromise) {
         self.pending_resume_promises
             .borrow_mut()
             .push(promise.to_traced());
@@ -251,6 +253,11 @@ impl BaseAudioContext {
     }
 
     pub(crate) fn resume(&self) {
+        // Step 4.
+        if !self.is_allowed_to_start() {
+            return;
+        }
+
         let this = Trusted::new(self);
         // Set the rendering thread state to 'running' and start
         // rendering the audio graph.
@@ -341,37 +348,6 @@ impl BaseAudioContextMethods<crate::DomTypeHolder> for BaseAudioContext {
     /// <https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-state>
     fn State(&self) -> AudioContextState {
         self.state.get()
-    }
-
-    /// <https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-resume>
-    fn Resume(&self, cx: &mut CurrentRealm) -> RootedPromise {
-        // Step 1.
-        let promise = Promise::new_in_realm(cx);
-
-        // Step 2.
-        if self.audio_context_impl.lock().unwrap().state() == ProcessingState::Closed {
-            promise.reject_error(cx, Error::InvalidState(None));
-            return promise;
-        }
-
-        // Step 3.
-        if self.state.get() == AudioContextState::Running {
-            promise.resolve_native(cx, &());
-            return promise;
-        }
-
-        self.push_pending_resume_promise(&promise);
-
-        // Step 4.
-        if !self.is_allowed_to_start() {
-            return promise;
-        }
-
-        // Steps 5 and 6.
-        self.resume();
-
-        // Step 7.
-        promise
     }
 
     /// <https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-destination>

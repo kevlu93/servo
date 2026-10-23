@@ -148,6 +148,30 @@ impl AudioContextMethods<crate::DomTypeHolder> for AudioContext {
         }
     }
 
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiocontext-resume>
+    fn Resume(&self, cx: &mut CurrentRealm) -> RootedPromise {
+        // Step 1.
+        let promise = Promise::new_in_realm(cx);
+        // Step 2.
+        if self.context.audio_context_impl().lock().unwrap().state() == ProcessingState::Closed {
+            promise.reject_error(cx, Error::InvalidState(None));
+            return promise;
+        }
+
+        // Step 3.
+        if self.context.State() == AudioContextState::Running {
+            promise.resolve_native(cx, &());
+            return promise;
+        }
+        self.context.push_pending_resume_promise(&promise);
+        // TODO: In previous specs, BaseAudioContext had the resume method.
+        // For now, call the resume method of BaseAudioContext.
+        // In subsequent PR, move the resume method and pending promises fields
+        // to the AudioContext.
+        self.context.resume();
+        promise
+    }
+
     /// <https://webaudio.github.io/web-audio-api/#dom-audiocontext-suspend>
     fn Suspend(&self, cx: &mut CurrentRealm) -> RootedPromise {
         // Step 1.
